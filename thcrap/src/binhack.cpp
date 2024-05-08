@@ -134,11 +134,12 @@ static TH_NOINLINE const char* consume_float_value(const char *const expr, patch
 	char* expr_next;
 	errno = 0;
 	double result = _strtod_l(expr, &expr_next, lc_neutral.locale);
-	if (expr == expr_next) {
+	if unexpected(expr == expr_next) {
 		// Not actually a floating-point number, keep going though
 		val->type = PVT_NONE;
 		return expr + 1;
-	} else if ((result == HUGE_VAL || result == -HUGE_VAL) && errno == ERANGE) {
+	}
+	if unexpected(fabs(result) == HUGE_VAL && errno == ERANGE) {
 		log_printf("ERROR: Floating point constant \"%.*s\" out of range!\n", expr_next - expr, expr);
 		return NULL;
 	}
@@ -158,6 +159,36 @@ static TH_NOINLINE const char* consume_float_value(const char *const expr, patch
 			val->ld = /*(LongDouble80)*/result;
 			return expr_next + 1;
 	}
+}
+
+static TH_NOINLINE double constpool_float_value(const char *const expr, patch_val_t *const val, char end_char, uintptr_t rel_source, HMODULE hMod) {
+	char* expr_next;
+	double result = _strtod_l(expr, &expr_next, lc_neutral.locale);
+	if (expr != expr_next) {
+		// Value was a float literal, so just use it directly
+		return result;
+	}
+	// Test for option values
+	if (expr[0] == '<') {
+		if (get_patch_value(expr, val, NULL, NULL, NULL) != NULL) {
+			switch (val->type) {
+				case PVT_BYTE: return val->b;
+				case PVT_SBYTE: return val->sb;
+				case PVT_WORD: return val->w;
+				case PVT_SWORD: return val->sw;
+				case PVT_DWORD: return val->i;
+				case PVT_SDWORD: return val->si;
+				case PVT_QWORD: return (double)val->q;
+				case PVT_SQWORD: return (double)val->sq;
+				case PVT_FLOAT: return val->f;
+				case PVT_DOUBLE: return val->d;
+				case PVT_LONGDOUBLE: return val->ld;
+			}
+		}
+	}
+	// Fallback to the expression parser
+	(void)eval_expr(expr, end_char, &val->z, NULL, rel_source, hMod);
+	return val->z;
 }
 
 // Data to be rendered into a constpool.
@@ -320,43 +351,19 @@ void constpool_apply(HackpointMemoryPage* page_array) {
 						if (key.type < PVT_FLOAT) {
 							(void)eval_expr(&exprs[element_pos], end_char, &pool_value.z, NULL, value.addr, value.source_module);
 						} else {
-							(void)consume_float_value(&exprs[element_pos], &pool_value);
-#ifndef GCC_COMPAT
-							// Literally the only time when x87
-							// is probably still faster: converting to/from arbitrary widths
-							switch (pool_value.type) {
-								default:
-									eval_expr(&exprs[element_pos], end_char, &pool_value.z, NULL, value.addr, value.source_module);
-									__asm { __asm FILD QWORD PTR[pool_value] }
-									break;
-								case PVT_FLOAT: __asm { __asm FLD DWORD PTR[pool_value] } break;
-								case PVT_DOUBLE: __asm { __asm FLD QWORD PTR[pool_value] } break;
-								case PVT_LONGDOUBLE: __asm { __asm FLD TBYTE PTR[pool_value] } break;
-							}
+							double float_value = constpool_float_value(&exprs[element_pos], &pool_value, end_char, value.addr, value.source_module);
 							switch (key.type) {
 								default: TH_UNREACHABLE;
-								case PVT_FLOAT: __asm { __asm FSTP DWORD PTR[pool_value] } break;
-								case PVT_DOUBLE: __asm { __asm FSTP QWORD PTR[pool_value] } break;
-								case PVT_LONGDOUBLE: __asm { __asm FSTP TBYTE PTR[pool_value] } break;
-							}
-#else
-							LongDouble80 temp_value;
-							switch (pool_value.type) {
-								default:
-									eval_expr(&exprs[element_pos], end_char, &pool_value.z, NULL, value.addr, value.source_module);
-									temp_value = pool_value.z;
+								case PVT_FLOAT:
+									pool_value.f = (float)float_value;
 									break;
-								case PVT_FLOAT:      temp_value = pool_value.f; break;
-								case PVT_DOUBLE:     temp_value = pool_value.d; break;
-								case PVT_LONGDOUBLE: temp_value = pool_value.ld; break;
+								case PVT_DOUBLE:
+									pool_value.d = float_value;
+									break;
+								case PVT_LONGDOUBLE:
+									pool_value.ld = float_value;
+									break;
 							}
-							switch (key.type) {
-								default: TH_UNREACHABLE;
-								case PVT_FLOAT:      pool_value.f = temp_value; break;
-								case PVT_DOUBLE:     pool_value.d = temp_value; break;
-								case PVT_LONGDOUBLE: pool_value.ld = temp_value; break;
-							}
-#endif
 						}
 					}
 				}
@@ -699,7 +706,7 @@ static TH_FORCEINLINE const char* check_for_code_string_cast(const char* expr, p
 		case 'p':
 			if (expr[1] == ':') {
 				val->type = PVT_POINTER;
-				return expr + 4;
+				return expr + 2;
 			}
 			break;
 		case 'i': case 'u': case 'f':
@@ -1405,6 +1412,7 @@ bool codecave_from_json(const char *name, json_t *in, codecave_t *out) {
 	bool export_val = false;
 	CodecaveAccessType access_val = EXECUTE_READWRITE;
 	size_t fill_val = 0;
+	size_t align_val = 16;
 
 	if (json_is_object(in)) {
 		if (json_object_get_eval_bool_default(in, "ignore", false, JEVAL_DEFAULT) ||
@@ -1449,6 +1457,22 @@ bool codecave_from_json(const char *name, json_t *in, codecave_t *out) {
 				log_printf("ERROR: invalid json type specified for fill value of codecave %s, must be 32-bit integer or string\n", name);
 				return false;
 			case JEVAL_SUCCESS:
+			case JEVAL_NULL_PTR:
+				break;
+		}
+
+		switch (json_object_get_eval_int(in, "align", &align_val, JEVAL_STRICT)) {
+			default:
+				log_printf("ERROR: invalid json type specified for align value of codecave %s, must be 32-bit integer or string\n", name);
+				return false;
+			case JEVAL_SUCCESS:
+				// Round the alignment to the next power of 2 (including 1)
+				if (unsigned long bit; _BitScanReverse(&bit, align_val - 1)) {
+					align_val = 1u << (bit + 1);
+				} else {
+					align_val = 1u;
+				}
+				TH_FALLTHROUGH;
 			case JEVAL_NULL_PTR:
 				break;
 		}
@@ -1508,6 +1532,7 @@ bool codecave_from_json(const char *name, json_t *in, codecave_t *out) {
 		// export_val = false;
 		// access_val = EXECUTE_READWRITE;
 		// fill_val = 0;
+		// align_val = 16;
 	}
 	else if (json_is_integer(in)) {
 		size_val = (size_t)json_integer_value(in);
@@ -1515,6 +1540,7 @@ bool codecave_from_json(const char *name, json_t *in, codecave_t *out) {
 		// export_val = false;
 		access_val = READWRITE;
 		// fill_val = 0;
+		// align_val = 16;
 	}
 	else {
 		// Don't print an error, this can be used for comments
@@ -1546,6 +1572,7 @@ bool codecave_from_json(const char *name, json_t *in, codecave_t *out) {
 	out->size = size_val;
 	out->fill = (uint8_t)fill_val;
 	out->export_codecave = export_val;
+	out->align = (uint32_t)align_val;
 	out->virtual_address = NULL;
 
 	return true;
@@ -1577,7 +1604,8 @@ size_t codecaves_apply(codecave_t *codecaves, size_t codecaves_count, HMODULE hM
 			++codecave_export_count;
 		}
 		const size_t size = codecaves[i].size + codecave_sep_size_min;
-		codecaves_full_size[i] = AlignUpToMultipleOf2(size, 16);
+		// This doesn't make good use of padding bytes
+		codecaves_full_size[i] = AlignUpToMultipleOf2(size, (int32_t)codecaves[i].align);
 		codecaves_alloc_size[codecaves[i].access_type] += codecaves_full_size[i];
 	}
 

@@ -120,6 +120,7 @@ int nsml_init()
 
 		jsonvfs_game_add_map("data/csv/*/spellcard.cv1.jdiff", { "spells.js" });
 		jsonvfs_game_add_map("data/csv/*/storyspell.cv1.jdiff", { "spells.js" });
+		jsonvfs_game_add("data/csv/*/spellcard.cv1.jdiff", { "spellcomments.js" }, th105_spellcomment_generator);
 	}
 	else if (game_id == TH123) {
 		set_resolve_chain_game(th123_resolve_chain_game);
@@ -137,14 +138,20 @@ int nsml_init()
 		char *pattern_story = fn_for_game("data/csv/*/storyspell.cv1.jdiff");
 		char *spells_th105 = fn_for_th105("spells.js");
 		char *spells_th123 = fn_for_game("spells.js");
+		char *spellcomments_th105 = fn_for_th105("spellcomments.js");
+		char *spellcomments_th123 = fn_for_game("spellcomments.js");
 		jsonvfs_add_map(pattern_spell, { spells_th105 });
 		jsonvfs_add_map(pattern_spell, { spells_th123 });
 		jsonvfs_add_map(pattern_story, { spells_th105 });
 		jsonvfs_add_map(pattern_story, { spells_th123 });
+		jsonvfs_add(pattern_spell, { spellcomments_th105 }, th105_spellcomment_generator);
+		jsonvfs_add(pattern_spell, { spellcomments_th123 }, th105_spellcomment_generator);
 		SAFE_FREE(pattern_spell);
 		SAFE_FREE(pattern_story);
 		SAFE_FREE(spells_th105);
 		SAFE_FREE(spells_th123);
+		SAFE_FREE(spellcomments_th105);
+		SAFE_FREE(spellcomments_th123);
 	}
 	return 0;
 }
@@ -152,7 +159,7 @@ int nsml_init()
 static void megamari_xor(const TasofroFile *fr, BYTE *buffer, size_t size)
 {
 	BYTE key = ((fr->offset >> 1) | 8) & 0xFF;
-	for (unsigned int i = 0; i < size; i++) {
+	for (size_t i = 0; i < size; i++) {
 		buffer[i] ^= key;
 	}
 }
@@ -160,7 +167,7 @@ static void megamari_xor(const TasofroFile *fr, BYTE *buffer, size_t size)
 static void nsml_xor(const TasofroFile *fr, BYTE *buffer, size_t size)
 {
 	BYTE key = ((fr->offset >> 1) | 0x23) & 0xFF;
-	for (unsigned int i = 0; i < size; i++) {
+	for (size_t i = 0; i < size; i++) {
 		buffer[i] ^= key;
 	}
 }
@@ -174,7 +181,7 @@ static void th105_xor(const TasofroFile *fr, BYTE *buffer, size_t size)
 		unsigned char xorval = 0x8b;
 		unsigned char xoradd = 0x71;
 		unsigned char xoraddadd = 0x95;
-		for (unsigned int i = 0; i < size; i++) {
+		for (size_t i = 0; i < size; i++) {
 			buffer[i] ^= xorval;
 			xorval += xoradd;
 			xoradd += xoraddadd;
@@ -422,8 +429,8 @@ extern "C" int BP_th105_font_spacing(x86_reg_t *regs, json_t *bp_info)
 DWORD WINAPI th105_GetGlyphOutlineU(HDC hdc, UINT uChar, UINT uFormat, LPGLYPHMETRICS lpgm, DWORD cbBuffer, LPVOID lpvBuffer, const MAT2 *lpmat2)
 {
 	uChar = CharToUTF16(uChar);
-
-	if (uChar & 0xFFFF0000 ||
+	
+	if (uChar > WCHAR_MAX ||
 		font_has_character(hdc, uChar)) {
 		// is_character_in_font won't work if the character doesn't fit into a WCHAR.
 		// When it happens, we'll be optimistic and hope our font have that character.
